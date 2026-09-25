@@ -8,7 +8,15 @@ import time
 import nodes
 import folder_paths
 import execution
-from comfy_execution.jobs import JobStatus, get_job, get_all_jobs, validate_job_id
+from comfy_execution.jobs import (
+    JobStatus,
+    get_job,
+    get_all_jobs,
+    validate_job_id,
+    cancel_job,
+    CANCEL_PENDING,
+    CANCEL_RUNNING,
+)
 import uuid
 import urllib
 import json
@@ -31,23 +39,25 @@ from comfy.deploy_environment import get_deploy_environment
 import comfy.utils
 import comfy.model_management
 from comfy_api import feature_flags
+from comfy.comfy_api_env import get_environment_overrides
 import node_helpers
 from comfyui_version import __version__
 from app.frontend_management import FrontendManager, parse_version
 from comfy_api.internal import _ComfyNodeInternal
-from app.assets.seeder import asset_seeder
-from app.assets.api.routes import register_assets_routes
-from app.assets.services.ingest import register_file_in_place
 from app.assets.services.asset_management import resolve_hash_to_path
+from app.assets.event_log import emit
 
 from app.user_manager import UserManager
 from app.model_manager import ModelFileManager
 from app.custom_node_manager import CustomNodeManager
 from app.subgraph_manager import SubgraphManager
 from app.node_replace_manager import NodeReplaceManager
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 from api_server.routes.internal.internal_routes import InternalRoutes
 from protocol import BinaryEventTypes
+
+if TYPE_CHECKING:
+    from app.assets.manager import AssetManager
 
 # Import cache control middleware
 from middleware.cache_middleware import cache_control
@@ -118,6 +128,7 @@ def create_cors_middleware(allowed_origin: str):
         return response
 
     return cors_middleware
+
 
 def is_loopback(host):
     if host is None:
@@ -202,9 +213,10 @@ def create_block_external_middleware():
 
 
 class PromptServer():
-    def __init__(self, loop):
+    def __init__(self, loop, asset_manager: "AssetManager"):
         PromptServer.instance = self
 
+        self.asset_manager = asset_manager
         self.user_manager = UserManager()
         self.model_file_manager = ModelFileManager()
         self.custom_node_manager = CustomNodeManager()
@@ -243,11 +255,10 @@ class PromptServer():
             else args.front_end_root
         )
         logging.info(f"[Prompt Server] web root: {self.web_root}")
-        if args.enable_assets:
-            register_assets_routes(self.app, self.user_manager)
-        else:
-            register_assets_routes(self.app)
-            asset_seeder.disable()
+        self.asset_manager.register_routes(self.app, self.user_manager)
+        self.asset_manager.set_event_sink(self.send_sync)
+        if self.asset_manager.enabled:
+            emit("assets.enabled", hashing_enabled=args.enable_asset_hashing)
         routes = web.RouteTableDef()
         self.routes = routes
         self.last_node_id = None
@@ -429,20 +440,22 @@ class PromptServer():
 
                 resp = {"name" : filename, "subfolder": subfolder, "type": image_upload_type}
 
-                if args.enable_assets:
-                    try:
-                        tag = image_upload_type if image_upload_type in ("input", "output") else "input"
-                        result = register_file_in_place(abs_path=filepath, name=filename, tags=[tag])
-                        resp["asset"] = {
-                            "id": result.ref.id,
-                            "name": result.ref.name,
-                            "asset_hash": result.asset.hash,
-                            "size": result.asset.size_bytes,
-                            "mime_type": result.asset.mime_type,
-                            "tags": result.tags,
-                        }
-                    except Exception:
-                        logging.warning("Failed to register uploaded image as asset", exc_info=True)
+                view = self.asset_manager.register_upload(
+                    abs_path=filepath,
+                    name=filename,
+                    upload_type=image_upload_type,
+                    subfolder=subfolder,
+                    content_written=not image_is_duplicate,
+                )
+                if view is not None:
+                    resp["asset"] = {
+                        "id": view.asset.id,
+                        "name": view.asset.name,
+                        "asset_hash": view.asset_hash,
+                        "size": view.size,
+                        "mime_type": view.mime_type,
+                        "tags": view.tags,
+                    }
 
                 return web.json_response(resp)
             else:
@@ -510,8 +523,11 @@ class PromptServer():
                 # node preview, it constructs /view?filename=<asset_hash>, so this
                 # endpoint must resolve blake3 hashes to their on-disk file paths.
                 if filename.startswith("blake3:"):
-                    owner_id = self.user_manager.get_request_user_id(request)
-                    result = resolve_hash_to_path(filename, owner_id=owner_id)
+                    # Side-effect call: get_request_user_id raises KeyError for an unknown or
+                    # system user in multi-user mode, which is what gates hash resolution.
+                    # The returned id is deliberately unused (resolution is not owner-scoped).
+                    self.user_manager.get_request_user_id(request)
+                    result = resolve_hash_to_path(filename)
                     if result is None:
                         return web.Response(status=404)
                     file, filename, resolved_content_type = result.abs_path, result.download_name, result.content_type
@@ -608,17 +624,42 @@ class PromptServer():
                             or 'application/octet-stream'
                         )
 
-                        # For security, force certain mimetypes to download instead of display
-                        if content_type in {'text/html', 'text/html-sandboxed', 'application/xhtml+xml', 'text/javascript', 'text/css'}:
-                            content_type = 'application/octet-stream'  # Forces download
+                        # For security, force renderable/active types (HTML, JS,
+                        # CSS, SVG, XML — anything that can carry inline <script>
+                        # and execute in the page origin) to download instead of
+                        # displaying inline, preventing stored XSS. SVG loaded
+                        # into an <img> is exempt, see renders_safely_as_image.
+                        # The attachment disposition is the load-bearing guard: a
+                        # bare filename= hint does not force a download per
+                        # RFC 6266, so we only attach it on the dangerous branch
+                        # to avoid breaking inline display of legitimate images.
+                        # Escape backslash/quote per RFC 6266 quoted-string so a
+                        # filename containing a double quote (which passes the
+                        # ".."/leading-slash filter above) can't break out of the
+                        # header's quoted-string and malform the disposition.
+                        safe_filename = filename.replace("\\", "\\\\").replace('"', '\\"')
+                        disposition = f"filename=\"{safe_filename}\""
+                        headers = {"X-Content-Type-Options": "nosniff"}
+                        sec_fetch_dest = request.headers.get('Sec-Fetch-Dest')
+                        if folder_paths.is_dangerous_content_type(content_type):
+                            # This response now depends on a request header, so
+                            # it must not be reused across destinations.
+                            # FileResponse emits Last-Modified/ETag and nothing
+                            # sets Cache-Control on /view, which makes it
+                            # heuristically cacheable: without these headers a
+                            # cache could replay the inline SVG served to an
+                            # <img> to a later document navigation of the same
+                            # URL and re-enable the stored XSS, or replay the
+                            # attachment to an <img> and re-break the preview.
+                            headers["Vary"] = "Sec-Fetch-Dest"
+                            headers["Cache-Control"] = "no-store"
+                            if not folder_paths.renders_safely_as_image(content_type, sec_fetch_dest):
+                                content_type = 'application/octet-stream'
+                                disposition = f"attachment; filename=\"{safe_filename}\""
 
-                        return web.FileResponse(
-                            file,
-                            headers={
-                                "Content-Disposition": f"filename=\"{filename}\"",
-                                "Content-Type": content_type
-                            }
-                        )
+                        headers["Content-Disposition"] = disposition
+                        headers["Content-Type"] = content_type
+                        return web.FileResponse(file, headers=headers)
 
             return web.Response(status=404)
 
@@ -700,7 +741,11 @@ class PromptServer():
 
         @routes.get("/features")
         async def get_features(request):
-            return web.json_response(feature_flags.get_server_features())
+            features = feature_flags.get_server_features()
+            overrides = get_environment_overrides()
+            if overrides:
+                features.update(overrides)
+            return web.json_response(features)
 
         @routes.get("/prompt")
         async def get_prompt(request):
@@ -757,7 +802,7 @@ class PromptServer():
 
         @routes.get("/object_info")
         async def get_object_info(request):
-            asset_seeder.start(roots=("models", "input", "output"))
+            self.asset_manager.ensure_scan_started()
             with folder_paths.cache_helper:
                 out = {}
                 for x in nodes.NODE_CLASS_MAPPINGS:
@@ -898,6 +943,107 @@ class PromptServer():
                 )
 
             return web.json_response(job)
+
+        def _cancel_job_by_id(job_id):
+            """Cancel a single job by id using the queue's existing mechanics.
+
+            Running jobs are interrupted (same mechanism as /interrupt); pending
+            jobs are dequeued (same mechanism as /queue {"delete": [...]}).
+            Already-finished or unknown ids are no-ops. State-agnostic.
+
+            Returns True when a cancel was actually dispatched (running or
+            pending job), False when the call was a no-op (terminal/unknown id).
+            """
+            running, queued = self.prompt_queue.get_current_queue()
+            history = self.prompt_queue.get_history()
+
+            def interrupt(prompt_id):
+                logging.info(f"Cancelling running prompt {prompt_id}")
+                # Atomic: only interrupts if the job is still the one running,
+                # so a cancel can't land on a prompt that started in the gap
+                # since the snapshot above. Returns whether it actually fired.
+                return self.prompt_queue.interrupt_if_running(prompt_id)
+
+            def dequeue(prompt_id):
+                logging.info(f"Cancelling pending prompt {prompt_id}")
+                return self.prompt_queue.delete_queue_item(lambda a: a[1] == prompt_id)
+
+            classification = cancel_job(job_id, running, queued, history, interrupt, dequeue)
+            return classification in (CANCEL_RUNNING, CANCEL_PENDING)
+
+        @routes.post("/api/jobs/{job_id}/cancel")
+        async def cancel_job_by_id(request):
+            """Cancel a single job by id, regardless of state.
+
+            Idempotent: cancelling a job that has already finished, or an id
+            that is not known, returns 200 with {"cancelled": false} rather
+            than an error.
+            """
+            job_id = request.match_info.get("job_id", None)
+            if not job_id:
+                return web.json_response(
+                    {"error": "job_id is required"},
+                    status=400
+                )
+
+            cancelled = _cancel_job_by_id(job_id)
+            return web.json_response({"cancelled": cancelled})
+
+        @routes.post("/api/jobs/cancel")
+        async def cancel_jobs_batch(request):
+            """Cancel a batch of jobs by id.
+
+            Body: {"job_ids": ["<uuid>", ...]}
+
+            Best-effort and idempotent: every well-formed id is cancelled if it
+            is running or pending; ids that are already finished or unknown are
+            no-ops, not errors. A batch of all no-ops still returns 200 with
+            {"cancelled": false}. This matches the single-cancel endpoint and
+            means "cancel all" still cancels the in-progress jobs even if some
+            finished between the client's snapshot and the request. Malformed
+            ids are still rejected up front with 400 (see below).
+            """
+            try:
+                json_data = await request.json()
+            except json.JSONDecodeError:
+                return web.json_response(
+                    {"error": "Request body must be valid JSON"},
+                    status=400
+                )
+
+            job_ids = json_data.get("job_ids") if isinstance(json_data, dict) else None
+            if not isinstance(job_ids, list):
+                return web.json_response(
+                    {"error": "job_ids must be a list"},
+                    status=400
+                )
+
+            # Validate that every element is a well-formed job id before doing
+            # anything else.  An unhashable element (e.g. a nested dict or list)
+            # would cause a TypeError when used as a history dict key; a
+            # non-string or non-UUID value is never a valid id.  Reject early
+            # with 400 rather than letting the classify loop raise 500.
+            invalid_ids = []
+            for jid in job_ids:
+                try:
+                    validate_job_id(jid)
+                except (ValueError, AttributeError):
+                    invalid_ids.append(jid if isinstance(jid, str) else repr(jid))
+            if invalid_ids:
+                return web.json_response(
+                    {"error": "job_ids contains invalid id(s)", "invalid_ids": invalid_ids},
+                    status=400,
+                )
+
+            # Best-effort: cancel each id that is still running/pending; an id
+            # that has finished or never existed is a no-op rather than a reason
+            # to fail the whole batch.
+            cancelled = False
+            for jid in job_ids:
+                if _cancel_job_by_id(jid):
+                    cancelled = True
+
+            return web.json_response({"cancelled": cancelled})
 
         @routes.get("/history")
         async def get_history(request):

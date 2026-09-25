@@ -30,10 +30,12 @@ import gc
 import os
 from contextlib import contextmanager, nullcontext
 import comfy.memory_management
+import comfy.system_memory
 import comfy.utils
 import comfy.quant_ops
 import comfy_aimdo.host_buffer
 import comfy_aimdo.vram_buffer
+from comfy.internal_logging import detail
 
 from typing import TYPE_CHECKING
 if TYPE_CHECKING:
@@ -107,6 +109,24 @@ if args.deterministic:
     torch.use_deterministic_algorithms(True, warn_only=True)
 
 directml_enabled = False
+XLA_ENABLED = args.xla
+if XLA_ENABLED:
+    if args.cpu or args.cpu_vae or args.directml is not None or args.lowvram or args.novram or args.enable_dynamic_vram:
+        raise ValueError("--xla cannot be combined with CPU, DirectML, lowvram, novram, or dynamic VRAM options")
+    try:
+        import torch_xla
+    except ModuleNotFoundError as error:
+        raise RuntimeError("--xla requires a PyTorch/XLA TPU installation") from error
+    import torch_xla.core.xla_model as xm
+    import torch_xla.runtime as xr
+
+    if xr.device_type() != "TPU":
+        raise RuntimeError("--xla requires a TPU runtime")
+    xr.use_spmd()
+    if xr.global_runtime_device_count() != 8:
+        raise RuntimeError("--xla requires eight TPU devices")
+    lowvram_available = False
+
 if args.directml is not None:
     logging.warning("WARNING: torch-directml barely works, is very slow, has not been updated in over 1 year and might be removed soon, please don't use it, there are better options.")
     import torch_directml
@@ -193,6 +213,8 @@ def is_wsl():
 def get_torch_device():
     global directml_enabled
     global cpu_state
+    if XLA_ENABLED:
+        return torch_xla.device()
     if directml_enabled:
         global directml_device
         return directml_device
@@ -212,6 +234,8 @@ def get_torch_device():
 
 def get_all_torch_devices(exclude_current=False):
     global cpu_state
+    if XLA_ENABLED:
+        return [] if exclude_current else [get_torch_device()]
     devices = []
     if cpu_state == CPUState.GPU:
         # NVIDIA + AMD/ROCm both expose their GPUs through torch.cuda.*;
@@ -316,8 +340,12 @@ def get_total_memory(dev=None, torch_total_too=False):
     if dev is None:
         dev = get_torch_device()
 
-    if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
-        mem_total = psutil.virtual_memory().total
+    if hasattr(dev, 'type') and dev.type == 'xla':
+        info = xm.get_memory_info(dev)
+        mem_total = info.get('bytes_limit', info.get('kb_total', 0) * 1024)
+        mem_total_torch = info.get('bytes_used', mem_total - info.get('kb_free', 0) * 1024)
+    elif hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+        mem_total = comfy.system_memory.virtual_memory_total()
         mem_total_torch = mem_total
     else:
         if directml_enabled:
@@ -360,8 +388,11 @@ def mac_version():
         return None
 
 total_vram = get_total_memory(get_torch_device()) / (1024 * 1024)
-total_ram = psutil.virtual_memory().total / (1024 * 1024)
+total_ram = comfy.system_memory.virtual_memory_total() / (1024 * 1024)
 logging.info("Total VRAM {:0.0f} MB, total RAM {:0.0f} MB".format(total_vram, total_ram))
+cgroup_ram_limit = comfy.system_memory.cgroup_memory_limit()
+if cgroup_ram_limit is not None:
+    logging.info("RAM limited by cgroup to {:0.0f} MB (host has {:0.0f} MB)".format(cgroup_ram_limit / (1024 * 1024), psutil.virtual_memory().total / (1024 * 1024)))
 
 try:
     logging.info("pytorch version: {}".format(torch_version))
@@ -420,6 +451,8 @@ else:
 
 def is_nvidia():
     global cpu_state
+    if XLA_ENABLED:
+        return False
     if cpu_state == CPUState.GPU:
         if torch.version.cuda:
             return True
@@ -427,6 +460,8 @@ def is_nvidia():
 
 def is_amd():
     global cpu_state
+    if XLA_ENABLED:
+        return False
     if cpu_state == CPUState.GPU:
         if torch.version.hip:
             return True
@@ -464,7 +499,7 @@ try:
         if torch_version_numeric[0] >= 2:
             if ENABLE_PYTORCH_ATTENTION == False and args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
                 ENABLE_PYTORCH_ATTENTION = True
-    if is_intel_xpu() or is_ascend_npu() or is_mlu() or is_ixuca():
+    if is_intel_xpu() or is_ascend_npu() or is_mlu() or is_ixuca() or XLA_ENABLED:
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
             ENABLE_PYTORCH_ATTENTION = True
 except:
@@ -473,7 +508,7 @@ except:
 
 SUPPORT_FP8_OPS = args.supports_fp8_compute
 
-AMD_RDNA2_AND_OLDER_ARCH = ["gfx1030", "gfx1031", "gfx1010", "gfx1011", "gfx1012", "gfx906", "gfx900", "gfx803"]
+AMD_RDNA2_AND_OLDER_ARCH = ["gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036", "gfx1010", "gfx1011", "gfx1012", "gfx906", "gfx900", "gfx803"]
 AMD_ENABLE_MIOPEN_ENV = 'COMFYUI_ENABLE_MIOPEN'
 
 try:
@@ -489,30 +524,50 @@ try:
         except:
             rocm_version = (6, -1)
 
-        def aotriton_supported(gpu_arch):
-            path = torch.__path__[0]
-            path = os.path.join(os.path.join(path, "lib"), "aotriton.images")
-            gfx = set(map(lambda a: a[4:], filter(lambda a: a.startswith("amd-gfx"), os.listdir(path))))
-            if gpu_arch in gfx:
+        def aotriton_supported():
+            """Whether pytorch reports flash attention as usable on this gpu.
+
+            can_use_flash_attention() evaluates runtime eligibility for the given
+            parameters; on a ROCm build that includes checking the gpu arch against the
+            arches AOTriton was built for. Querying it avoids assuming where the kernel
+            images live inside the torch install. The probe tensor is shaped and
+            typed to pass the unrelated SDPA checks, so False means no hardware support
+            rather than a rejected shape.
+
+            It answers True on a supported arch whose kernel image was never shipped,
+            and that only fails at launch, without raising. So run one attention
+            through the flash backend and force the pending error check.
+            """
+            try:
+                device = get_torch_device()
+                if not torch.backends.cuda.is_flash_attention_available():  # not built with flash attention
+                    return False
+                q = torch.zeros((1, 1, 8, 64), dtype=torch.float16, device=device)
+                params = torch.backends.cuda.SDPAParams(q, q, q, None, 0.0, False, False)
+                if not torch.backends.cuda.can_use_flash_attention(params, False):
+                    return False
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+                with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                    torch.nn.functional.scaled_dot_product_attention(q, q, q)
+                torch.cuda.synchronize()
+                torch.zeros(1, device=device).add_(1).item()  # raises if the launch above failed
                 return True
-            if "{}x".format(gpu_arch[:-1]) in gfx:
-                return True
-            if "{}xx".format(gpu_arch[:-2]) in gfx:
-                return True
-            return False
+            except Exception as e:
+                logging.warning("Could not run flash attention, disabling it: {}".format(e))
+                return False
 
         logging.info("AMD arch: {}".format(arch))
         logging.info("ROCm version: {}".format(rocm_version))
         if args.use_split_cross_attention == False and args.use_quad_cross_attention == False:
-            if aotriton_supported(arch):  # AMD efficient attention implementation depends on aotriton.
+            if aotriton_supported():  # AMD efficient attention implementation depends on aotriton.
                 if torch_version_numeric >= (2, 7):  # works on 2.6 but doesn't actually seem to improve much
-                    if any((a in arch) for a in ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1150", "gfx1151"]):  # TODO: more arches, TODO: gfx950
+                    if any((a in arch) for a in ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1150", "gfx1151", "gfx1170", "gfx1171"]):  # TODO: more arches, TODO: gfx950
                         ENABLE_PYTORCH_ATTENTION = True
                 if rocm_version >= (7, 0):
-                   if any((a in arch) for a in ["gfx1200", "gfx1201"]):
-                       ENABLE_PYTORCH_ATTENTION = True
+                    if any((a in arch) for a in ["gfx1200", "gfx1201"]):
+                        ENABLE_PYTORCH_ATTENTION = True
         if torch_version_numeric >= (2, 7) and rocm_version >= (6, 4):
-            if any((a in arch) for a in ["gfx1200", "gfx1201", "gfx950"]):  # TODO: more arches, "gfx942" gives error on pytorch nightly 2.10 1013 rocm7.0
+            if any((a in arch) for a in ["gfx1200", "gfx1201", "gfx950", "gfx1170", "gfx1171"]):  # TODO: more arches, "gfx942" gives error on pytorch nightly 2.10 1013 rocm7.0
                 SUPPORT_FP8_OPS = True
 
 except:
@@ -551,6 +606,8 @@ if args.lowvram:
 elif args.novram:
     set_vram_to = VRAMState.NO_VRAM
 elif args.highvram or args.gpu_only:
+    vram_state = VRAMState.HIGH_VRAM
+elif XLA_ENABLED:
     vram_state = VRAMState.HIGH_VRAM
 
 FORCE_FP32 = False
@@ -616,6 +673,8 @@ PIN_PRESSURE_HYSTERESIS = 256 * 1024 * 1024
 #Freeing registerables on pressure does imply a GPU sync, so go big on
 #the hysteresis so each expensive sync gives us back a good chunk.
 REGISTERABLE_PIN_HYSTERESIS = 2048 * 1024 * 1024
+WINDOWS_PIN_EVICTION_SWAP_PERCENT = 5.0
+WINDOWS_PIN_EVICTION_EMERGENCY_AVAILABLE = 512 * 1024 ** 2
 
 def module_size(module):
     module_mem = 0
@@ -630,30 +689,102 @@ def mark_mmap_dirty(storage):
     if mmap_refs is not None:
         DIRTY_MMAPS.add(mmap_refs[0])
 
-def free_pins(size, evict_active=False):
+PIN_SUBSETS = [ "weights", "patches" ]
+LOADED_PIN_SUBSETS = [ "weights-loaded", "patches-loaded" ]
+FAST_PIN_SUBSETS = [ "weights-fast", "patches-fast" ]
+
+def models_for_pin_eviction(active, current_prompt=None):
+    for loaded_model in current_loaded_models:
+        model = loaded_model.model
+        if model is None or not model.is_dynamic():
+            continue
+        pin_state = model.model.dynamic_pins[model.load_device]
+        if ((active is None or pin_state["active"] == active) and
+            (current_prompt is None or pin_state["current_prompt"] == current_prompt)):
+            yield model
+
+def free_model_pins(size, subsets, current_prompt, active, registrations=False):
     freed_total = 0
-    for loaded_model in reversed(current_loaded_models):
+    for model in models_for_pin_eviction(active, current_prompt=current_prompt):
         if size <= 0:
             return freed_total
-        model = loaded_model.model
-        if model is not None and model.is_dynamic() and (evict_active or not model.model.dynamic_pins[model.load_device]["active"]):
-            freed = model.partially_unload_ram(size)
-            freed_total += freed
-            size -= freed
+        if registrations:
+            freed = model.unregister_inactive_pins(size, subsets=subsets)
+        else:
+            freed = model.partially_unload_ram(size, subsets=subsets)
+        if freed > 0:
+            detail(
+                "Pin eviction: model=%s subsets=%s workflow=%s active=%s action=%s freed_mb=%.1f",
+                model.model.__class__.__name__, subsets, current_prompt, active,
+                "unregister" if registrations else "destroy", freed / (1024 ** 2),
+            )
+        freed_total += freed
+        size -= freed
     return freed_total
 
-def ensure_pin_budget(size, evict_active=False):
+def pin_eviction_tiers(loaded, evict_active):
+    tiers = [
+        (FAST_PIN_SUBSETS, False, False),
+        (PIN_SUBSETS, False, None),
+        (LOADED_PIN_SUBSETS, False, None),
+        (FAST_PIN_SUBSETS, True, False),
+        (LOADED_PIN_SUBSETS, True, None),
+    ]
+    if not loaded:
+        tiers.append((PIN_SUBSETS, True, False))
+        if evict_active:
+            tiers.extend([
+                (FAST_PIN_SUBSETS, False, True),
+                (FAST_PIN_SUBSETS, True, True),
+                (PIN_SUBSETS, True, True),
+            ])
+    return tiers
+
+def registration_eviction_tiers(evict_active):
+    subsets = PIN_SUBSETS + LOADED_PIN_SUBSETS
+    tiers = [
+        (FAST_PIN_SUBSETS, False, False, False),
+        (subsets, False, False, True),
+        (FAST_PIN_SUBSETS, True, False, False),
+        (subsets, True, False, True),
+    ]
+    if evict_active:
+        tiers.extend([
+            (FAST_PIN_SUBSETS, False, True, False),
+            (subsets, False, True, True),
+            (FAST_PIN_SUBSETS, True, True, False),
+            (subsets, True, True, True),
+        ])
+    return tiers
+
+def free_pins(size, evict_active=False, loaded=False):
+    freed = 0
+    for subsets, current_prompt, active in pin_eviction_tiers(loaded, evict_active):
+        freed += free_model_pins(size - freed, subsets, current_prompt, active)
+    return freed
+
+def should_free_pins_for_ram_pressure(shortfall):
+    if shortfall <= 0:
+        return False
+    if not WINDOWS:
+        return True
+    if comfy.system_memory.virtual_memory_available() < WINDOWS_PIN_EVICTION_EMERGENCY_AVAILABLE:
+        return True
+    try:
+        return psutil.swap_memory().percent >= WINDOWS_PIN_EVICTION_SWAP_PERCENT
+    except RuntimeError as err:
+        logging.warning("Could not read Windows swap usage; falling back to RAM-pressure pin eviction: %s", err)
+        return True
+
+def ensure_pin_budget(size, evict_active=False, loaded=False):
     if args.high_ram:
         return True
-    if args.fast_disk:
-        shortfall = TOTAL_PINNED_MEMORY + size - MAX_PINNED_MEMORY
-    else:
-        shortfall = size + max(comfy.memory_management.RAM_CACHE_HEADROOM / 2, 2048 * 1024 ** 2) - psutil.virtual_memory().available
+    shortfall = size + max(comfy.memory_management.RAM_CACHE_HEADROOM / 2, 2048 * 1024 ** 2) - comfy.system_memory.virtual_memory_available()
     if shortfall <= 0:
         return True
 
     to_free = shortfall + PIN_PRESSURE_HYSTERESIS
-    return free_pins(to_free, evict_active=evict_active) >= shortfall
+    return free_pins(to_free, evict_active=evict_active, loaded=loaded) >= shortfall
 
 def free_registrations(shortfall, evict_active=True):
     if MAX_PINNED_MEMORY <= 0:
@@ -662,23 +793,26 @@ def free_registrations(shortfall, evict_active=True):
         return True
 
     shortfall += REGISTERABLE_PIN_HYSTERESIS
-    for loaded_model in reversed(current_loaded_models):
-        model = loaded_model.model
-        if model is not None and model.is_dynamic() and not model.model.dynamic_pins[model.load_device]["active"]:
-            shortfall -= model.unregister_inactive_pins(shortfall)
-            if shortfall <= 0:
-                return True
-    if evict_active:
-        for loaded_model in current_loaded_models:
-            model = loaded_model.model
-            if model is not None and model.is_dynamic() and model.model.dynamic_pins[model.load_device]["active"]:
-                shortfall -= model.unregister_inactive_pins(shortfall)
-                if shortfall <= 0:
-                    return True
+    for subsets, current_prompt, active, registrations in registration_eviction_tiers(evict_active):
+        shortfall -= free_model_pins(shortfall, subsets, current_prompt, active, registrations=registrations)
     return shortfall <= REGISTERABLE_PIN_HYSTERESIS
 
 def ensure_pin_registerable(size, evict_active=True):
     return free_registrations(TOTAL_PINNED_MEMORY + size - MAX_PINNED_MEMORY, evict_active=evict_active)
+
+
+_XLA_RUNTIME = None
+
+
+def get_xla_runtime():
+    global _XLA_RUNTIME
+    if not XLA_ENABLED:
+        return None
+    if _XLA_RUNTIME is None:
+        from comfy.ldm.minimax.xla_backend import H3XLARuntime
+        _XLA_RUNTIME = H3XLARuntime()
+    return _XLA_RUNTIME
+
 
 class LoadedModel:
     def __init__(self, model: ModelPatcher):
@@ -732,6 +866,8 @@ class LoadedModel:
         self.model_use_more_vram(use_more_vram, force_patch_weights=force_patch_weights)
 
         real_model = self.model.model
+        if XLA_ENABLED:
+            get_xla_runtime().place(real_model)
 
 
         self.real_model = weakref.ref(real_model)
@@ -804,6 +940,8 @@ def minimum_inference_memory():
 
 def free_memory(memory_required, device, keep_loaded=[], for_dynamic=False, pins_required=0, ram_required=0):
     cleanup_models_gc()
+    if not for_dynamic:
+        detail("Non dynamic memory free called! memory_required=%s pins_required=%s ram_required=%s", memory_required, pins_required, ram_required)
     unloaded_model = []
     can_unload = []
     unloaded_models = []
@@ -942,6 +1080,9 @@ def load_models_gpu(models, memory_required=0, force_patch_weights=False, minimu
             lowvram_model_memory = 0.1
 
         loaded_model.model_load(lowvram_model_memory, force_patch_weights=force_patch_weights)
+        vram_used = 0 if is_device_cpu(torch_dev) else loaded_model.model_loaded_memory()
+        ram_used = model.loaded_ram_size() if model.is_dynamic() else loaded_model.model_memory() - vram_used
+        detail("Model loaded: patcher=%s model=%s ram_mb=%.1f vram_mb=%.1f", model.__class__.__name__, model.model.__class__.__name__, ram_used / (1024 ** 2), vram_used / (1024 ** 2))
         current_loaded_models.insert(0, loaded_model)
     return
 
@@ -1118,15 +1259,21 @@ def unet_manual_cast(weight_dtype, inference_device, supported_dtypes=[torch.flo
     return torch.float32
 
 def text_encoder_offload_device():
+    if XLA_ENABLED:
+        return get_torch_device()
     if args.gpu_only:
         return get_torch_device()
     else:
         return torch.device("cpu")
 
 def text_encoder_device():
+    if XLA_ENABLED:
+        return get_torch_device()
     if args.gpu_only:
         return get_torch_device()
-    elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM) or comfy.memory_management.aimdo_enabled:
+    if comfy.memory_management.aimdo_enabled:
+        return get_torch_device()
+    elif vram_state in (VRAMState.HIGH_VRAM, VRAMState.NORMAL_VRAM):
         if should_use_fp16(prioritize_performance=False):
             return get_torch_device()
         else:
@@ -1166,10 +1313,15 @@ def text_encoder_dtype(device=None):
     if is_device_cpu(device):
         return torch.float16
 
+    if XLA_ENABLED:
+        return torch.bfloat16
+
     return torch.float16
 
 
 def intermediate_device():
+    if XLA_ENABLED:
+        return get_torch_device()
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -1187,6 +1339,8 @@ def vae_device():
     return get_torch_device()
 
 def vae_offload_device():
+    if XLA_ENABLED:
+        return get_torch_device()
     if args.gpu_only:
         return get_torch_device()
     else:
@@ -1215,6 +1369,8 @@ def get_autocast_device(dev):
     return "cuda"
 
 def supports_dtype(device, dtype): #TODO
+    if XLA_ENABLED and dtype in FLOAT8_TYPES:
+        return False
     if dtype == torch.float32:
         return True
     if is_device_cpu(device):
@@ -1226,6 +1382,8 @@ def supports_dtype(device, dtype): #TODO
     return False
 
 def supports_cast(device, dtype): #TODO
+    if XLA_ENABLED and dtype in FLOAT8_TYPES:
+        return False
     if dtype == torch.float32:
         return True
     if dtype == torch.float16:
@@ -1254,6 +1412,8 @@ def pick_weight_dtype(dtype, fallback_dtype, device=None):
     return dtype
 
 def device_supports_non_blocking(device):
+    if is_device_type(device, 'xla'):
+        return False
     if args.force_non_blocking:
         return True
     if is_device_mps(device):
@@ -1296,6 +1456,8 @@ def current_stream(device):
         return torch.cuda.current_stream()
     elif is_device_xpu(device):
         return torch.xpu.current_stream()
+    elif is_device_npu(device):
+        return torch.npu.current_stream(device)
     else:
         return None
 
@@ -1305,8 +1467,13 @@ STREAM_CAST_BUFFERS = {}
 LARGEST_CASTED_WEIGHT = (None, 0)
 STREAM_AIMDO_CAST_BUFFERS = {}
 LARGEST_AIMDO_CASTED_WEIGHT = (None, 0)
+CROSS_STEP_STATE = weakref.WeakSet()
 
 DEFAULT_AIMDO_CAST_BUFFER_RESERVATION_SIZE = 16 * 1024 ** 3
+
+# NOTE: devs/agents: this is temporary and will be removed in a future comfy. Not supported for custom node use.
+def _register_cross_step(module):
+    CROSS_STEP_STATE.add(module)
 
 def get_cast_buffer(offload_stream, device, size, ref):
     global LARGEST_CASTED_WEIGHT
@@ -1362,21 +1529,27 @@ def reset_cast_buffers():
         mmap_obj.bounce()
     DIRTY_MMAPS.clear()
 
+    for module in CROSS_STEP_STATE:
+        del module._comfy_cross_step_state
+    CROSS_STEP_STATE.clear()
+
     for loaded_model in current_loaded_models:
         model = loaded_model.model
         if model is not None and model.is_dynamic():
             pin_state = model.model.dynamic_pins[model.load_device]
 
             if pin_state["active"]:
-                *_, buckets = pin_state["weights"]
-                for size, bucket in list(buckets.items()):
-                    bucket[:] = [ entry for entry in bucket if entry[-1] is not None ]
-                    if not bucket:
-                        del buckets[size]
+                for subset in ("weights", "weights-loaded", "weights-fast"):
+                    *_, buckets = pin_state[subset]
+                    for size, bucket in list(buckets.items()):
+                        bucket[:] = [ entry for entry in bucket if entry[-1] is not None ]
+                        if not bucket:
+                            del buckets[size]
 
             pin_state["active"] = False
-            model.partially_unload_ram(1e30, subsets=[ "patches" ])
-            model.model.dynamic_pins[model.load_device]["patches"] = (comfy_aimdo.host_buffer.HostBuffer(0, 8 * 1024 * 1024, pinned_hostbuf_size(model.model_size())), [], [-1], [0], [0], {})
+            model.partially_unload_ram(1e30, subsets=[ "patches", "patches-loaded", "patches-fast" ])
+            for subset in ("patches", "patches-loaded", "patches-fast"):
+                pin_state[subset] = (comfy_aimdo.host_buffer.HostBuffer(0, 8 * 1024 * 1024, pinned_hostbuf_size(model.model_size())), [], [-1], [0], [0], {})
 
     STREAM_CAST_BUFFERS.clear()
     STREAM_AIMDO_CAST_BUFFERS.clear()
@@ -1412,6 +1585,18 @@ def get_offload_stream(device):
         for k in range(NUM_STREAMS):
             s1 = torch.xpu.Stream(device=device, priority=0)
             s1.as_context = torch.xpu.stream
+            ss.append(s1)
+        STREAMS[device] = ss
+        s = ss[stream_counter]
+        stream_counters[device] = stream_counter
+        return s
+    elif is_device_npu(device):
+        ss = []
+        # Match the CUDA/XPU stream interface used by the shared offload path.
+        # torch.npu.stream provides the context manager for torch-npu streams.
+        for k in range(NUM_STREAMS):
+            s1 = torch.npu.Stream(device=device, priority=0)
+            s1.as_context = torch.npu.stream
             ss.append(s1)
         STREAMS[device] = ss
         s = ss[stream_counter]
@@ -1486,13 +1671,32 @@ def cast_to_device(tensor, device, dtype, copy=False):
 PINNED_MEMORY = {}
 TOTAL_PINNED_MEMORY = 0
 MAX_PINNED_MEMORY = -1
+
+def get_disk_swap_total():
+    if not os.path.exists("/proc/swaps"):
+        return 0
+
+    total = 0
+    try:
+        with open("/proc/swaps", encoding="utf-8") as swaps:
+            next(swaps, None)
+            for line in swaps:
+                filename, _, size, _, _ = line.rsplit(maxsplit=4)
+                if os.path.basename(os.path.realpath(filename)).startswith("zram"):
+                    continue
+                total += int(size) * 1024
+    except:
+        logging.warning("Could not get amount of swap memory on system.")
+    return total
+
 if not args.disable_pinned_memory:
     if is_nvidia() or is_amd():
         ram = get_total_memory(torch.device("cpu"))
         if WINDOWS:
             MAX_PINNED_MEMORY = ram * 0.40  # Windows limit is apparently 50%
         else:
-            MAX_PINNED_MEMORY = ram * 0.90
+            swap = 0 if comfy.system_memory.cgroup_memory_limit() is not None else get_disk_swap_total()
+            MAX_PINNED_MEMORY = max(ram * 0.40, min(ram * 0.90, ram - 4 * 1024 ** 3, ram + swap - 16 * 1024 ** 3))
         logging.info("Enabled pinned memory {}".format(MAX_PINNED_MEMORY // (1024 * 1024)))
 
 PINNING_ALLOWED_TYPES = set(["Tensor", "Parameter", "QuantizedTensor"])
@@ -1512,7 +1716,7 @@ def discard_cuda_async_error():
         #Dump it! We already know about it from the synchronous return
         pass
 
-def pin_memory(tensor):
+def pin_memory(tensor, evict_active=True):
     global TOTAL_PINNED_MEMORY
     if MAX_PINNED_MEMORY <= 0:
         return False
@@ -1534,7 +1738,8 @@ def pin_memory(tensor):
 
     size = tensor.nbytes
     comfy.memory_management.extra_ram_release(comfy.memory_management.RAM_CACHE_HEADROOM)
-    ensure_pin_registerable(size)
+    if not ensure_pin_registerable(size, evict_active=evict_active):
+        return False
 
     ptr = tensor.data_ptr()
     if ptr == 0:
@@ -1583,6 +1788,9 @@ def unpin_memory(tensor):
 def sage_attention_enabled():
     return args.use_sage_attention
 
+def comfy_kitchen_attention_enabled():
+    return args.use_ck_attention
+
 def flash_attention_enabled():
     return args.use_flash_attention
 
@@ -1590,6 +1798,8 @@ def xformers_enabled():
     global directml_enabled
     global cpu_state
     if cpu_state != CPUState.GPU:
+        return False
+    if XLA_ENABLED:
         return False
     if is_intel_xpu():
         return False
@@ -1650,13 +1860,26 @@ def force_upcast_attention_dtype():
     else:
         return None
 
+#Developers and agents: You almost never want to call this function from Model code as it does
+#not account for ComfyUIs smart memory feature combining with Dynamic VRAM, where inactive models
+#are preserved in VRAM right up until there is higher priority demand (I.E whatever you want to do
+#that makes you meansure VRAM from model code). Instead call get_free_memory() on the ModelPatcher
+#for your BaseModel object (.current_patcher) instead to count this VRAM as free and then Dynamic
+#VRAM will evict that extra VRAM for you when you use it.
 def get_free_memory(dev=None, torch_free_too=False):
     global directml_enabled
     if dev is None:
         dev = get_torch_device()
 
-    if hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
-        mem_free_total = psutil.virtual_memory().available
+    if hasattr(dev, 'type') and dev.type == 'xla':
+        info = xm.get_memory_info(dev)
+        if 'bytes_limit' in info:
+            mem_free_total = info['bytes_limit'] - info.get('bytes_used', 0)
+        else:
+            mem_free_total = info.get('kb_free', 0) * 1024
+        mem_free_torch = 0
+    elif hasattr(dev, 'type') and (dev.type == 'cpu' or dev.type == 'mps'):
+        mem_free_total = comfy.system_memory.virtual_memory_available()
         mem_free_torch = mem_free_total
     else:
         if directml_enabled:
@@ -1722,6 +1945,12 @@ def is_device_xpu(device):
 def is_device_cuda(device):
     return is_device_type(device, 'cuda')
 
+def is_device_npu(device):
+    return is_device_type(device, 'npu')
+
+def is_device_xla(device):
+    return is_device_type(device, 'xla')
+
 def set_torch_device(device):
     """Set the current device for the given torch device. Supports CUDA and XPU."""
     if is_device_cuda(device):
@@ -1745,6 +1974,9 @@ def should_use_fp16(device=None, model_params=0, prioritize_performance=True, ma
         return True
 
     if FORCE_FP32:
+        return False
+
+    if XLA_ENABLED:
         return False
 
     if is_directml_enabled():
@@ -1810,6 +2042,9 @@ def should_use_bf16(device=None, model_params=0, prioritize_performance=True, ma
 
     if FORCE_FP32:
         return False
+
+    if XLA_ENABLED:
+        return True
 
     if directml_enabled:
         return False
@@ -1904,7 +2139,27 @@ def supports_mxfp8_compute(device=None):
     return True
 
 def supports_fp64(device=None):
-    if is_device_mps(device):
+    if XLA_ENABLED:
+        return False
+    if (device is not None and is_device_mps(device)) or mps_mode():
+        return False
+
+    if is_intel_xpu():
+        return False
+
+    if is_directml_enabled():
+        return False
+
+    if is_ixuca():
+        return False
+
+    return True
+
+def supports_int8_compute(device=None):
+    # The eager comfy_kitchen backend implements int8 weight-only quantized
+    # matmul via torch._int_mm, which PyTorch does not implement for MPS.
+    # https://github.com/pytorch/pytorch/issues/141287
+    if (device is not None and is_device_mps(device)) or mps_mode():
         return False
 
     if is_intel_xpu():
@@ -1942,13 +2197,21 @@ def lora_compute_dtype(device):
 def synchronize():
     if cpu_mode():
         return
+    if XLA_ENABLED:
+        torch_xla.sync(wait=True)
+        return
     if is_intel_xpu():
         torch.xpu.synchronize()
+    elif is_ascend_npu():
+        torch.npu.synchronize()
     elif torch.cuda.is_available():
         torch.cuda.synchronize()
 
 def soft_empty_cache(force=False):
     if cpu_mode():
+        return
+    if XLA_ENABLED:
+        torch_xla.sync(wait=True)
         return
     global cpu_state
     if cpu_state == CPUState.MPS:
